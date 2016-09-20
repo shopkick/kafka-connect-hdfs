@@ -70,6 +70,7 @@ public class TopicPartitionWriter {
   private int flushSize;
   private long rotateIntervalMs;
   private long lastRotate;
+  private boolean isFirst;
   private RecordWriterProvider writerProvider;
   private Configuration conf;
   private AvroData avroData;
@@ -165,6 +166,8 @@ public class TopicPartitionWriter {
       this.hiveUpdateFutures = hiveUpdateFutures;
       hivePartitions = new HashSet<>();
     }
+
+    setIsFirst(true);
   }
 
   private enum State {
@@ -298,6 +301,22 @@ public class TopicPartitionWriter {
       }
     }
     if (buffer.isEmpty()) {
+      // committing files after waiting for rotateIntervalMs time but less than flush.size records available
+      if (recordCounter > 0 && shouldRotate(now)) {
+        log.info("committing files after waiting for rotateIntervalMs time but less than flush.size records available.");
+        lastRotate = System.currentTimeMillis();
+
+        try {
+          closeTempFile();
+          appendToWAL();
+          commitFile();
+        } catch (IOException e) {
+          log.error("Exception on topic partition {}: ", tp, e);
+          failureTime = System.currentTimeMillis();
+          setRetryTimeout(timeoutMs);
+        }
+      }
+
       resume();
       state = State.WRITE_STARTED;
     }
@@ -373,14 +392,22 @@ public class TopicPartitionWriter {
     this.state = state;
   }
 
+  private void setIsFirst(boolean isFirst) {
+    this.isFirst = isFirst;
+  }
+
   private boolean shouldRotate(long now) {
-    if (recordCounter >= flushSize) {
-      return true;
-    } else if (rotateIntervalMs <= 0) {
-      return false;
-    } else {
-      return now - lastRotate >= rotateIntervalMs;
+    //EC: taken from 3.x -- removed scheduledRotation
+    boolean periodicRotation = rotateIntervalMs > 0 && (!isFirst && now - lastRotate >= rotateIntervalMs);
+    // boolean scheduledRotation = rotateScheduleIntervalMs > 0 && now >= nextScheduledRotate;
+    boolean messageSizeRotation = recordCounter >= flushSize;
+
+    if (isFirst) {
+      lastRotate = now;
+      setIsFirst(false);
     }
+
+    return periodicRotation /*|| scheduledRotation*/ || messageSizeRotation;
   }
 
   private void readOffset() throws ConnectException {
